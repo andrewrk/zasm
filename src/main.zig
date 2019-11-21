@@ -30,6 +30,17 @@ const Assembly = struct {
             source: []const u8,
             file_name: []const u8,
         },
+        symbol_outside_section: struct {
+            token: Token,
+            source: []const u8,
+            file_name: []const u8,
+        },
+        duplicate_symbol: struct {
+            token: Token,
+            other_symbol: Token,
+            source: []const u8,
+            file_name: []const u8,
+        },
 
         fn render(self: Error, stream: var) !void {
             switch (self) {
@@ -51,6 +62,33 @@ const Assembly = struct {
                         loc.line + 1,
                         loc.column + 1,
                         info.source[info.token.start..info.token.end],
+                    );
+                },
+                .symbol_outside_section => |info| {
+                    const loc = tokenLocation(info.source, info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: symbol outside section: {}\n",
+                        info.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
+                        info.source[info.token.start..info.token.end],
+                    );
+                },
+                .duplicate_symbol => |info| {
+                    const loc = tokenLocation(info.source, info.token);
+                    const other_loc = tokenLocation(info.source, info.other_symbol);
+                    try stream.print(
+                        "{}:{}:{}: error: duplicate symbol: {}\n" ++
+                            "{}:{}:{}: note: duplicate symbol: {}\n",
+                        info.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
+                        info.source[info.token.start..info.token.end],
+
+                        info.file_name,
+                        other_loc.line + 1,
+                        other_loc.column + 1,
+                        info.source[info.other_symbol.start..info.other_symbol.end],
                     );
                 },
             }
@@ -177,16 +215,30 @@ const AsmFile = struct {
     tokenizer: Tokenizer,
     assembly: *Assembly,
     current_section: ?*Section = null,
+    current_symbol: ?*Symbol = null,
     sections: SectionTable,
     globals: GlobalSet,
     put_back_buffer: [1]Token,
     put_back_count: u1,
+    symbols: SymbolTable,
 
     const SectionTable = std.StringHashMap(*Section);
+    const SymbolTable = std.StringHashMap(*Symbol);
     const GlobalSet = std.StringHashMap(void);
 
     const Section = struct {
         name: []const u8,
+        layout: std.ArrayList(Item),
+
+        const Item = union(enum) {
+            symbol: *Symbol,
+        };
+    };
+
+    const Symbol = struct {
+        source_token: Token,
+        name: []const u8,
+        section: *Section,
     };
 
     fn tokenSlice(asm_file: AsmFile, token: Token) []const u8 {
@@ -201,6 +253,7 @@ const AsmFile = struct {
         const section = try self.sections.allocator.create(Section);
         section.* = Section{
             .name = name,
+            .layout = std.ArrayList(Section.Item).init(self.sections.allocator),
         };
         gop.kv.value = section;
         return section;
@@ -208,6 +261,37 @@ const AsmFile = struct {
 
     fn setCurrentSection(self: *AsmFile, name: []const u8) !void {
         self.current_section = try self.findOrCreateSection("text");
+    }
+
+    fn beginSymbol(self: *AsmFile, source_token: Token, name: []const u8) !void {
+        const current_section = self.current_section orelse {
+            try self.assembly.errors.append(.{
+                .symbol_outside_section = .{
+                    .token = source_token,
+                    .source = self.source,
+                    .file_name = self.file_name,
+                },
+            });
+            return error.ParseFailure;
+        };
+        const symbol = try self.symbols.allocator.create(Symbol);
+        symbol.* = Symbol{
+            .source_token = source_token,
+            .name = name,
+            .section = current_section,
+        };
+        if (try self.symbols.put(name, symbol)) |existing_entry| {
+            try self.assembly.errors.append(.{
+                .duplicate_symbol = .{
+                    .token = source_token,
+                    .other_symbol = existing_entry.value.source_token,
+                    .source = self.source,
+                    .file_name = self.file_name,
+                },
+            });
+            return error.ParseFailure;
+        }
+        try current_section.layout.append(.{ .symbol = symbol });
     }
 
     fn addGlobal(self: *AsmFile, name: []const u8) !void {
@@ -260,6 +344,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
             .file_name = input_file,
             .sections = AsmFile.SectionTable.init(assembly.allocator),
             .globals = AsmFile.GlobalSet.init(assembly.allocator),
+            .symbols = AsmFile.SymbolTable.init(assembly.allocator),
             .source = try cwd.readFileAlloc(assembly.allocator, input_file, math.maxInt(usize)),
             .tokenizer = undefined,
             .put_back_buffer = undefined,
@@ -294,7 +379,8 @@ fn assembleExecutable(assembly: *Assembly) !void {
                 },
                 .identifier => {
                     if (asm_file.eatToken(.colon)) |_| {
-                        std.debug.panic("TODO: switch to section {}\n", asm_file.tokenSlice(token));
+                        const symbol_name = asm_file.tokenSlice(token);
+                        try asm_file.beginSymbol(token, symbol_name);
                     } else {
                         std.debug.panic("TODO: handle assembly instruction {}\n", asm_file.tokenSlice(token));
                     }
