@@ -13,12 +13,86 @@ const Cmd = enum {
     targets,
 };
 
+const Assembly = struct {
+    allocator: *mem.Allocator,
+    input_files: []const []const u8,
+    target: std.Target,
+    current_section: ?*Section,
+    errors: std.ArrayList(Error),
+
+    const Error = union(enum) {
+        unexpected_token: struct {
+            token: Token,
+            source: []const u8,
+            file_name: []const u8,
+        },
+
+        fn render(self: Error, stream: var) !void {
+            switch (self) {
+                .unexpected_token => |unexpected_token| {
+                    const loc = tokenLocation(unexpected_token.source, unexpected_token.token);
+                    try stream.print(
+                        "{}:{}:{}: error: unexpected token: {}\n",
+                        unexpected_token.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
+                        @tagName(unexpected_token.token.id),
+                    );
+                },
+            }
+        }
+    };
+};
+
+const Location = struct {
+    line: usize,
+    column: usize,
+    line_start: usize,
+    line_end: usize,
+};
+
+fn tokenLocation(source: []const u8, token: Token) Location {
+    const start_index = 0;
+    var loc = Location{
+        .line = 0,
+        .column = 0,
+        .line_start = start_index,
+        .line_end = source.len,
+    };
+    const token_start = token.start;
+    for (source[start_index..]) |c, i| {
+        if (i + start_index == token_start) {
+            loc.line_end = i + start_index;
+            while (loc.line_end < source.len and source[loc.line_end] != '\n') : (loc.line_end += 1) {}
+            return loc;
+        }
+        if (c == '\n') {
+            loc.line += 1;
+            loc.column = 0;
+            loc.line_start = i + 1;
+        } else {
+            loc.column += 1;
+        }
+    }
+    return loc;
+}
+
+const Section = struct {
+    name: []const u8,
+};
+
 pub fn main() anyerror!void {
     var arena = std.heap.ArenaAllocator.init(std.heap.direct_allocator);
     defer arena.deinit();
     const allocator = &arena.allocator;
 
-    var target: std.Target = .Native;
+    var assembly = Assembly{
+        .allocator = allocator,
+        .target = .Native,
+        .input_files = undefined,
+        .current_section = null,
+        .errors = std.ArrayList(Assembly.Error).init(allocator),
+    };
     var input_files = std.ArrayList([]const u8).init(allocator);
     var maybe_cmd: ?Cmd = null;
 
@@ -32,7 +106,7 @@ pub fn main() anyerror!void {
                 try dumpUsage(std.io.getStdOut());
                 return;
             } else if (mem.eql(u8, arg, "target")) {
-                target = try std.Target.parse(arg);
+                assembly.target = try std.Target.parse(arg);
             } else {
                 std.debug.warn("Invalid parameter: {}\n", full_arg);
                 dumpStdErrUsageAndExit();
@@ -65,7 +139,18 @@ pub fn main() anyerror!void {
             );
             return;
         },
-        .exe => return assembleExecutable(allocator, input_files.toSliceConst(), target),
+        .exe => {
+            assembly.input_files = input_files.toSliceConst();
+            assembleExecutable(&assembly) catch |err| switch (err) {
+                error.ParseFailure => {
+                    const stream = &std.io.getStdErr().outStream().stream;
+                    for (assembly.errors.toSliceConst()) |asm_err| {
+                        try asm_err.render(stream);
+                    }
+                },
+                else => |e| return e,
+            };
+        },
         .obj => {
             std.debug.warn("object files not yet implemented\n");
             process.exit(1);
@@ -77,16 +162,27 @@ pub fn main() anyerror!void {
     }
 }
 
-fn assembleExecutable(allocator: *mem.Allocator, input_files: []const []const u8, target: std.Target) !void {
+fn assembleExecutable(assembly: *Assembly) !void {
     const cwd = fs.Dir.cwd();
 
-    for (input_files) |input_file| {
-        const source = try cwd.readFileAlloc(allocator, input_file, math.maxInt(usize));
+    for (assembly.input_files) |input_file| {
+        const source = try cwd.readFileAlloc(assembly.allocator, input_file, math.maxInt(usize));
         var tokenizer = Tokenizer.init(source);
         while (true) {
             const token = tokenizer.next();
-            if (token.id == .eof) break;
-            std.debug.warn("{}\n", token.id);
+            switch (token.id) {
+                .eof => break,
+                else => {
+                    try assembly.errors.append(.{
+                        .unexpected_token = .{
+                            .token = token,
+                            .source = source,
+                            .file_name = input_file,
+                        },
+                    });
+                    return error.ParseFailure;
+                },
+            }
         }
     }
 }
