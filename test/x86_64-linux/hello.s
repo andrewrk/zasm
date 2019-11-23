@@ -12,4 +12,3 @@ _start:
 	.section	.rodata,"a"
 msg:
 	.ascii	"Hello, world!\n"
-	.size	msg, 14

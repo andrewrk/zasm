@@ -5,12 +5,15 @@ const mem = std.mem;
 const fs = std.fs;
 const process = std.process;
 const math = std.math;
+const data = @import("data.zig");
+const parseStringLiteral = std.zig.parseStringLiteral;
 
 const Cmd = enum {
     exe,
     obj,
     dis,
     targets,
+    tokenize,
 };
 
 const Assembly = struct {
@@ -30,6 +33,11 @@ const Assembly = struct {
             source: []const u8,
             file_name: []const u8,
         },
+        unrecognized_instruction: struct {
+            token: Token,
+            source: []const u8,
+            file_name: []const u8,
+        },
         symbol_outside_section: struct {
             token: Token,
             source: []const u8,
@@ -40,6 +48,22 @@ const Assembly = struct {
             other_symbol: Token,
             source: []const u8,
             file_name: []const u8,
+        },
+        bad_integer_literal: struct {
+            token: Token,
+            source: []const u8,
+            file_name: []const u8,
+        },
+        instr_outside_symbol: struct {
+            token: Token,
+            source: []const u8,
+            file_name: []const u8,
+        },
+        bad_string_literal: struct {
+            token: Token,
+            source: []const u8,
+            file_name: []const u8,
+            bad_index: usize,
         },
 
         fn render(self: Error, stream: var) !void {
@@ -64,6 +88,16 @@ const Assembly = struct {
                         info.source[info.token.start..info.token.end],
                     );
                 },
+                .unrecognized_instruction => |info| {
+                    const loc = tokenLocation(info.source, info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: unrecognized instruction: {}\n",
+                        info.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
+                        info.source[info.token.start..info.token.end],
+                    );
+                },
                 .symbol_outside_section => |info| {
                     const loc = tokenLocation(info.source, info.token);
                     try stream.print(
@@ -72,6 +106,36 @@ const Assembly = struct {
                         loc.line + 1,
                         loc.column + 1,
                         info.source[info.token.start..info.token.end],
+                    );
+                },
+                .bad_integer_literal => |info| {
+                    const loc = tokenLocation(info.source, info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: invalid integer literal: {}\n",
+                        info.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
+                        info.source[info.token.start..info.token.end],
+                    );
+                },
+                .bad_string_literal => |info| {
+                    const loc = tokenLocation(info.source, info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: invalid string literal at index {}: {}\n",
+                        info.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
+                        info.bad_index,
+                        info.source[info.token.start..info.token.end],
+                    );
+                },
+                .instr_outside_symbol => |info| {
+                    const loc = tokenLocation(info.source, info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: instruction outside symbol\n",
+                        info.file_name,
+                        loc.line + 1,
+                        loc.column + 1,
                     );
                 },
                 .duplicate_symbol => |info| {
@@ -142,6 +206,7 @@ pub fn main() anyerror!void {
     };
     var input_files = std.ArrayList([]const u8).init(allocator);
     var maybe_cmd: ?Cmd = null;
+    var debug_errors = false;
 
     const args = try process.argsAlloc(allocator);
     var arg_i: usize = 1;
@@ -154,6 +219,8 @@ pub fn main() anyerror!void {
                 return;
             } else if (mem.eql(u8, arg, "target")) {
                 assembly.target = try std.Target.parse(arg);
+            } else if (mem.eql(u8, arg, "debug-errors")) {
+                debug_errors = true;
             } else {
                 std.debug.warn("Invalid parameter: {}\n", full_arg);
                 dumpStdErrUsageAndExit();
@@ -194,6 +261,11 @@ pub fn main() anyerror!void {
                     for (assembly.errors.toSliceConst()) |asm_err| {
                         try asm_err.render(stream);
                     }
+                    if (debug_errors) {
+                        return err;
+                    } else {
+                        process.exit(1);
+                    }
                 },
                 else => |e| return e,
             };
@@ -206,8 +278,27 @@ pub fn main() anyerror!void {
             std.debug.warn("disassembly not yet implemented\n");
             process.exit(1);
         },
+        .tokenize => {
+            const stdout = &std.io.getStdOut().outStream().stream;
+            const cwd = fs.Dir.cwd();
+            for (input_files.toSliceConst()) |input_file| {
+                const source = try cwd.readFileAlloc(allocator, input_file, math.maxInt(usize));
+                var tokenizer = Tokenizer.init(source);
+                while (true) {
+                    const token = tokenizer.next();
+                    if (token.id == .eof) break;
+                    try stdout.print("{}: {}\n", @tagName(token.id), source[token.start..token.end]);
+                }
+            }
+        },
     }
 }
+
+const Arg = union(enum) {
+    register: data.Register,
+    immediate: u64,
+    symbol_ref: []const u8,
+};
 
 const AsmFile = struct {
     source: []const u8,
@@ -228,17 +319,36 @@ const AsmFile = struct {
 
     const Section = struct {
         name: []const u8,
-        layout: std.ArrayList(Item),
+        layout: std.ArrayList(*Symbol),
+    };
 
-        const Item = union(enum) {
-            symbol: *Symbol,
-        };
+    const Instruction = struct {
+        props: *const data.Instruction,
+
+        /// Relative to the containing Symbol
+        addr_offset: u64,
+
+        args: []Arg,
     };
 
     const Symbol = struct {
+        /// Relative to the containing Section
+        /// `undefined` until a second pass when addresses are calculated.
+        addr_offset: u64,
+
+        /// Starts at 0. Increments with instructions being added.
+        size: u64,
+
         source_token: Token,
         name: []const u8,
         section: *Section,
+
+        ops: std.ArrayList(PseudoOp),
+    };
+
+    const PseudoOp = union(enum) {
+        instruction: Instruction,
+        data: []const u8,
     };
 
     fn tokenSlice(asm_file: AsmFile, token: Token) []const u8 {
@@ -253,7 +363,7 @@ const AsmFile = struct {
         const section = try self.sections.allocator.create(Section);
         section.* = Section{
             .name = name,
-            .layout = std.ArrayList(Section.Item).init(self.sections.allocator),
+            .layout = std.ArrayList(*Symbol).init(self.sections.allocator),
         };
         gop.kv.value = section;
         return section;
@@ -276,9 +386,12 @@ const AsmFile = struct {
         };
         const symbol = try self.symbols.allocator.create(Symbol);
         symbol.* = Symbol{
+            .addr_offset = undefined,
+            .size = 0,
             .source_token = source_token,
             .name = name,
             .section = current_section,
+            .ops = std.ArrayList(PseudoOp).init(self.assembly.allocator),
         };
         if (try self.symbols.put(name, symbol)) |existing_entry| {
             try self.assembly.errors.append(.{
@@ -291,7 +404,8 @@ const AsmFile = struct {
             });
             return error.ParseFailure;
         }
-        try current_section.layout.append(.{ .symbol = symbol });
+        try current_section.layout.append(symbol);
+        self.current_symbol = symbol;
     }
 
     fn addGlobal(self: *AsmFile, name: []const u8) !void {
@@ -333,6 +447,19 @@ const AsmFile = struct {
         }
         return token;
     }
+
+    fn getCurrentSymbol(asm_file: *AsmFile, source_token: Token) !*Symbol {
+        return asm_file.current_symbol orelse {
+            try asm_file.assembly.errors.append(.{
+                .instr_outside_symbol = .{
+                    .token = source_token,
+                    .source = asm_file.source,
+                    .file_name = asm_file.file_name,
+                },
+            });
+            return error.ParseFailure;
+        };
+    }
 };
 
 fn assembleExecutable(assembly: *Assembly) !void {
@@ -366,6 +493,41 @@ fn assembleExecutable(assembly: *Assembly) !void {
                             try asm_file.addGlobal(asm_file.tokenSlice(ident));
                             if (asm_file.eatToken(.comma)) |_| continue else break;
                         }
+                    } else if (mem.eql(u8, dir_name, "section")) {
+                        _ = try asm_file.expectToken(.period);
+                        const sect_name_token = try asm_file.expectToken(.identifier);
+                        const sect_name = asm_file.tokenSlice(sect_name_token);
+                        try asm_file.setCurrentSection(sect_name);
+                        _ = try asm_file.expectToken(.comma);
+                        // TODO support this string literal doing anything
+                        _ = try asm_file.expectToken(.string_literal);
+                    } else if (mem.eql(u8, dir_name, "ascii")) {
+                        const current_symbol = try asm_file.getCurrentSymbol(dir_ident);
+
+                        const str_lit_tok = try asm_file.expectToken(.string_literal);
+                        const str_lit = asm_file.tokenSlice(str_lit_tok);
+                        var bad_index: usize = undefined;
+                        const bytes = parseStringLiteral(
+                            assembly.allocator,
+                            str_lit,
+                            &bad_index,
+                        ) catch |err| switch (err) {
+                            error.InvalidCharacter => {
+                                try assembly.errors.append(.{
+                                    .bad_string_literal = .{
+                                        .token = str_lit_tok,
+                                        .source = asm_file.source,
+                                        .file_name = asm_file.file_name,
+                                        .bad_index = bad_index,
+                                    },
+                                });
+                                return error.ParseFailure;
+                            },
+                            error.OutOfMemory => |e| return e,
+                        };
+
+                        try current_symbol.ops.append(.{ .data = bytes });
+                        current_symbol.size += bytes.len;
                     } else {
                         try assembly.errors.append(.{
                             .unrecognized_directive = .{
@@ -382,7 +544,96 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         const symbol_name = asm_file.tokenSlice(token);
                         try asm_file.beginSymbol(token, symbol_name);
                     } else {
-                        std.debug.panic("TODO: handle assembly instruction {}\n", asm_file.tokenSlice(token));
+                        const wanted_instr_name = asm_file.tokenSlice(token);
+                        const inst = for (data.instructions) |*inst| {
+                            if (mem.eql(u8, inst.name, wanted_instr_name)) {
+                                break inst;
+                            }
+                        } else {
+                            try assembly.errors.append(.{
+                                .unrecognized_instruction = .{
+                                    .token = token,
+                                    .source = asm_file.source,
+                                    .file_name = asm_file.file_name,
+                                },
+                            });
+                            return error.ParseFailure;
+                        };
+                        const current_symbol = try asm_file.getCurrentSymbol(token);
+                        var args_left: usize = inst.args.len;
+                        var first = true;
+                        var args = std.ArrayList(Arg).init(assembly.allocator);
+                        while (args_left != 0) : (args_left -= 1) {
+                            if (first) {
+                                first = false;
+                            } else {
+                                _ = try asm_file.expectToken(.comma);
+                            }
+                            const arg_token = asm_file.nextToken();
+                            const arg_text = asm_file.tokenSlice(arg_token);
+                            var arg: Arg = undefined;
+                            switch (arg_token.id) {
+                                .integer_literal => {
+                                    var text: []const u8 = undefined;
+                                    var base: u8 = undefined;
+                                    if (mem.startsWith(u8, arg_text, "0x")) {
+                                        base = 16;
+                                        text = arg_text[2..];
+                                    } else if (mem.startsWith(u8, arg_text, "0b")) {
+                                        base = 2;
+                                        text = arg_text[2..];
+                                    } else if (mem.startsWith(u8, arg_text, "0o")) {
+                                        base = 8;
+                                        text = arg_text[2..];
+                                    } else {
+                                        base = 10;
+                                        text = arg_text;
+                                    }
+                                    const imm = std.fmt.parseUnsigned(u64, text, base) catch |err| {
+                                        try asm_file.assembly.errors.append(.{
+                                            .bad_integer_literal = .{
+                                                .token = arg_token,
+                                                .source = asm_file.source,
+                                                .file_name = asm_file.file_name,
+                                            },
+                                        });
+                                        return error.ParseFailure;
+                                    };
+                                    arg = Arg{ .immediate = imm };
+                                },
+                                .identifier => {
+                                    inline for (std.meta.fields(data.Register)) |field| {
+                                        if (mem.eql(u8, arg_text, field.name)) {
+                                            const reg = @field(data.Register, field.name);
+                                            arg = Arg{ .register = reg };
+                                            break;
+                                        }
+                                    } else {
+                                        arg = Arg{ .symbol_ref = arg_text };
+                                    }
+                                },
+                                else => {
+                                    try asm_file.assembly.errors.append(.{
+                                        .unexpected_token = .{
+                                            .token = arg_token,
+                                            .source = asm_file.source,
+                                            .file_name = asm_file.file_name,
+                                        },
+                                    });
+                                    return error.ParseFailure;
+                                },
+                            }
+                            try args.append(arg);
+                        }
+
+                        try current_symbol.ops.append(.{
+                            .instruction = .{
+                                .props = inst,
+                                .addr_offset = current_symbol.size,
+                                .args = args.toSliceConst(),
+                            },
+                        });
+                        current_symbol.size += inst.size;
                     }
                 },
                 else => {
@@ -414,6 +665,7 @@ fn dumpUsage(file: fs.File) !void {
         \\  obj                  create an object file
         \\  dis                  disassemble a binary into source
         \\  targets              list the supported targets to stdout
+        \\  tokenize             (debug) tokenize the input files
         \\
         \\Options:
         \\  -help                dump this help text to stdout
