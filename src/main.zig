@@ -22,137 +22,128 @@ const Assembly = struct {
     target: std.Target,
     errors: std.ArrayList(Error),
 
+    pub const SourceInfo = struct {
+        token: Token,
+        source: []const u8,
+        file_name: []const u8,
+    };
+
     const Error = union(enum) {
         unexpected_token: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
         },
         unrecognized_directive: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
         },
         unrecognized_instruction: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
         },
         symbol_outside_section: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
         },
         duplicate_symbol: struct {
-            token: Token,
+            source_info: SourceInfo,
             other_symbol: Token,
-            source: []const u8,
-            file_name: []const u8,
         },
         bad_integer_literal: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
         },
         instr_outside_symbol: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
         },
         bad_string_literal: struct {
-            token: Token,
-            source: []const u8,
-            file_name: []const u8,
+            source_info: SourceInfo,
             bad_index: usize,
         },
 
+        fn printToStream(stream: var, comptime message: []const u8, source_info: SourceInfo, args: ...) !void {
+            const loc = tokenLocation(source_info.source, source_info.token);
+            try stream.print(
+                "{}:{}:{}: " ++ message,
+                source_info.file_name,
+                loc.line + 1,
+                loc.column + 1,
+                args,
+            );
+        }
+
         fn render(self: Error, stream: var) !void {
             switch (self) {
-                .unexpected_token => |unexpected_token| {
-                    const loc = tokenLocation(unexpected_token.source, unexpected_token.token);
-                    try stream.print(
-                        "{}:{}:{}: error: unexpected token: {}\n",
-                        unexpected_token.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
-                        @tagName(unexpected_token.token.id),
+                .unexpected_token => |info| {
+                    try printToStream(
+                        stream,
+                        "error: unexpected token: {}\n",
+                        info.source_info,
+                        @tagName(info.source_info.token.id),
                     );
                 },
                 .unrecognized_directive => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    try stream.print(
-                        "{}:{}:{}: error: unrecognized directive: {}\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
-                        info.source[info.token.start..info.token.end],
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: unrecognized directive: {}\n",
+                        si,
+                        si.source[si.token.start..si.token.end],
                     );
                 },
                 .unrecognized_instruction => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    try stream.print(
-                        "{}:{}:{}: error: unrecognized instruction: {}\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
-                        info.source[info.token.start..info.token.end],
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: unrecognized instruction: {}\n",
+                        si,
+                        si.source[si.token.start..si.token.end],
                     );
                 },
                 .symbol_outside_section => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    try stream.print(
-                        "{}:{}:{}: error: symbol outside section: {}\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
-                        info.source[info.token.start..info.token.end],
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: symbol outside section: {}\n",
+                        si,
+                        si.source[si.token.start..si.token.end],
                     );
                 },
                 .bad_integer_literal => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    try stream.print(
-                        "{}:{}:{}: error: invalid integer literal: {}\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
-                        info.source[info.token.start..info.token.end],
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: invalid integer literal: {}\n",
+                        si,
+                        si.source[si.token.start..si.token.end],
                     );
                 },
                 .bad_string_literal => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    try stream.print(
-                        "{}:{}:{}: error: invalid string literal at index {}: {}\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: invalid string literal at index {}: {}\n",
+                        si,
                         info.bad_index,
-                        info.source[info.token.start..info.token.end],
+                        si.source[si.token.start..si.token.end],
                     );
                 },
                 .instr_outside_symbol => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    try stream.print(
-                        "{}:{}:{}: error: instruction outside symbol\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: instruction outside symbol\n",
+                        si,
                     );
                 },
                 .duplicate_symbol => |info| {
-                    const loc = tokenLocation(info.source, info.token);
-                    const other_loc = tokenLocation(info.source, info.other_symbol);
-                    try stream.print(
-                        "{}:{}:{}: error: duplicate symbol: {}\n" ++
-                            "{}:{}:{}: note: duplicate symbol: {}\n",
-                        info.file_name,
-                        loc.line + 1,
-                        loc.column + 1,
-                        info.source[info.token.start..info.token.end],
+                    const si = info.source_info;
+                    const other_loc = tokenLocation(si.source, info.other_symbol);
+                    try printToStream(
+                        stream,
+                        "error: duplicate symbol: {}\n" ++
+                            "{}:{}:{}: note: original definition. \n",
+                        si,
+                        si.source[si.token.start..si.token.end],
 
-                        info.file_name,
+                        si.file_name,
                         other_loc.line + 1,
                         other_loc.column + 1,
-                        info.source[info.other_symbol.start..info.other_symbol.end],
                     );
                 },
             }
@@ -376,11 +367,7 @@ const AsmFile = struct {
     fn beginSymbol(self: *AsmFile, source_token: Token, name: []const u8) !void {
         const current_section = self.current_section orelse {
             try self.assembly.errors.append(.{
-                .symbol_outside_section = .{
-                    .token = source_token,
-                    .source = self.source,
-                    .file_name = self.file_name,
-                },
+                .symbol_outside_section = .{ .source_info = newSourceInfo(self, source_token) },
             });
             return error.ParseFailure;
         };
@@ -396,10 +383,8 @@ const AsmFile = struct {
         if (try self.symbols.put(name, symbol)) |existing_entry| {
             try self.assembly.errors.append(.{
                 .duplicate_symbol = .{
-                    .token = source_token,
+                    .source_info = newSourceInfo(self, source_token),
                     .other_symbol = existing_entry.value.source_token,
-                    .source = self.source,
-                    .file_name = self.file_name,
                 },
             });
             return error.ParseFailure;
@@ -437,11 +422,7 @@ const AsmFile = struct {
         const token = asm_file.nextToken();
         if (token.id != id) {
             try asm_file.assembly.errors.append(.{
-                .unexpected_token = .{
-                    .token = token,
-                    .source = asm_file.source,
-                    .file_name = asm_file.file_name,
-                },
+                .unexpected_token = .{ .source_info = newSourceInfo(asm_file, token) },
             });
             return error.ParseFailure;
         }
@@ -451,16 +432,20 @@ const AsmFile = struct {
     fn getCurrentSymbol(asm_file: *AsmFile, source_token: Token) !*Symbol {
         return asm_file.current_symbol orelse {
             try asm_file.assembly.errors.append(.{
-                .instr_outside_symbol = .{
-                    .token = source_token,
-                    .source = asm_file.source,
-                    .file_name = asm_file.file_name,
-                },
+                .instr_outside_symbol = .{ .source_info = newSourceInfo(asm_file, source_token) },
             });
             return error.ParseFailure;
         };
     }
 };
+
+fn newSourceInfo(asm_file: *AsmFile, tok: Token) Assembly.SourceInfo {
+    return .{
+        .token = tok,
+        .source = asm_file.source,
+        .file_name = asm_file.file_name,
+    };
+}
 
 fn assembleExecutable(assembly: *Assembly) !void {
     const cwd = fs.Dir.cwd();
@@ -515,9 +500,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                             error.InvalidCharacter => {
                                 try assembly.errors.append(.{
                                     .bad_string_literal = .{
-                                        .token = str_lit_tok,
-                                        .source = asm_file.source,
-                                        .file_name = asm_file.file_name,
+                                        .source_info = newSourceInfo(&asm_file, str_lit_tok),
                                         .bad_index = bad_index,
                                     },
                                 });
@@ -530,11 +513,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         current_symbol.size += bytes.len;
                     } else {
                         try assembly.errors.append(.{
-                            .unrecognized_directive = .{
-                                .token = dir_ident,
-                                .source = asm_file.source,
-                                .file_name = asm_file.file_name,
-                            },
+                            .unrecognized_directive = .{ .source_info = newSourceInfo(&asm_file, dir_ident) },
                         });
                         return error.ParseFailure;
                     }
@@ -551,11 +530,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                             }
                         } else {
                             try assembly.errors.append(.{
-                                .unrecognized_instruction = .{
-                                    .token = token,
-                                    .source = asm_file.source,
-                                    .file_name = asm_file.file_name,
-                                },
+                                .unrecognized_instruction = .{ .source_info = newSourceInfo(&asm_file, token) },
                             });
                             return error.ParseFailure;
                         };
@@ -591,11 +566,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                                     }
                                     const imm = std.fmt.parseUnsigned(u64, text, base) catch |err| {
                                         try asm_file.assembly.errors.append(.{
-                                            .bad_integer_literal = .{
-                                                .token = arg_token,
-                                                .source = asm_file.source,
-                                                .file_name = asm_file.file_name,
-                                            },
+                                            .bad_integer_literal = .{ .source_info = newSourceInfo(&asm_file, arg_token) },
                                         });
                                         return error.ParseFailure;
                                     };
@@ -614,11 +585,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                                 },
                                 else => {
                                     try asm_file.assembly.errors.append(.{
-                                        .unexpected_token = .{
-                                            .token = arg_token,
-                                            .source = asm_file.source,
-                                            .file_name = asm_file.file_name,
-                                        },
+                                        .unexpected_token = .{ .source_info = newSourceInfo(&asm_file, arg_token) },
                                     });
                                     return error.ParseFailure;
                                 },
@@ -638,11 +605,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                 },
                 else => {
                     try assembly.errors.append(.{
-                        .unexpected_token = .{
-                            .token = token,
-                            .source = asm_file.source,
-                            .file_name = asm_file.file_name,
-                        },
+                        .unexpected_token = .{ .source_info = newSourceInfo(&asm_file, token) },
                     });
                     return error.ParseFailure;
                 },
@@ -670,6 +633,7 @@ fn dumpUsage(file: fs.File) !void {
         \\Options:
         \\  -help                dump this help text to stdout
         \\  -target [arch]-[os]  specify the target for positional arguments
+        \\  -debug-errors        show stack trace on error
         \\
     );
 }
