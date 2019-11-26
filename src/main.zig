@@ -7,6 +7,8 @@ const process = std.process;
 const math = std.math;
 const data = @import("data.zig");
 const parseStringLiteral = std.zig.parseStringLiteral;
+const elf = std.elf;
+const assert = std.debug.assert;
 
 const Cmd = enum {
     exe,
@@ -21,6 +23,7 @@ const Assembly = struct {
     input_files: []const []const u8,
     target: std.Target,
     errors: std.ArrayList(Error),
+    entry_addr: u64,
 
     pub const SourceInfo = struct {
         token: Token,
@@ -194,6 +197,7 @@ pub fn main() anyerror!void {
         .target = .Native,
         .input_files = undefined,
         .errors = std.ArrayList(Assembly.Error).init(allocator),
+        .entry_addr = 0x80000000,
     };
     var input_files = std.ArrayList([]const u8).init(allocator);
     var maybe_cmd: ?Cmd = null;
@@ -611,7 +615,127 @@ fn assembleExecutable(assembly: *Assembly) !void {
                 },
             }
         }
+
+        try assembleExePass2(assembly, &asm_file);
     }
+}
+
+fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
+    const ptr_bit_width = assembly.target.getArchPtrBitWidth();
+    const endian = assembly.target.getArch().endian();
+    var hdr_buf: [@sizeOf(elf.Elf64_Ehdr) + @sizeOf(elf.Elf64_Phdr)]u8 = undefined;
+    var index: usize = 0;
+
+    mem.copy(u8, hdr_buf[index..], "\x7fELF");
+    index += 4;
+
+    hdr_buf[index] = switch (ptr_bit_width) {
+        32 => 1,
+        64 => 2,
+        else => return error.UnsupportedArchitecture,
+    };
+    index += 1;
+
+    hdr_buf[index] = switch (endian) {
+        .Little => 1,
+        .Big => 2,
+    };
+    index += 1;
+
+    hdr_buf[index] = 1; // ELF version
+    index += 1;
+
+    // OS ABI, often set to 0 regardless of target platform
+    // ABI Version, possibly used by glibc but not by static executables
+    // padding
+    mem.set(u8, hdr_buf[index..][0..9], 0);
+    index += 9;
+
+    assert(index == 16);
+
+    // TODO: https://github.com/ziglang/zig/issues/863 makes this (and all following) @ptrCast unnecessary
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), @enumToInt(elf.ET.EXEC), endian);
+    index += 2;
+
+    const machine = assembly.target.getArch().toElfMachine();
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), @enumToInt(machine), endian);
+    index += 2;
+
+    // ELF Version, again
+    mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), 1, endian);
+    index += 4;
+
+    switch (ptr_bit_width) {
+        32 => {
+            // e_entry
+            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), @intCast(u32, assembly.entry_addr), endian);
+            index += 4;
+
+            // e_phoff
+            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), @sizeOf(elf.Elf32_Ehdr), endian);
+            index += 4;
+
+            // e_shoff
+            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), 0, endian);
+            index += 4;
+        },
+        64 => {
+            // e_entry
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), assembly.entry_addr, endian);
+            index += 8;
+
+            // e_phoff
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), @sizeOf(elf.Elf64_Ehdr), endian);
+            index += 8;
+
+            // e_shoff
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), 0, endian);
+            index += 8;
+        },
+        else => unreachable,
+    }
+
+    // e_flags
+    mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), 0, endian);
+    index += 4;
+
+    const e_ehsize: u16 = switch (ptr_bit_width) {
+        32 => @sizeOf(elf.Elf32_Ehdr),
+        64 => @sizeOf(elf.Elf64_Ehdr),
+        else => unreachable,
+    };
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_ehsize, endian);
+    index += 2;
+
+    const e_phentsize: u16 = switch (ptr_bit_width) {
+        32 => @sizeOf(elf.Elf32_Phdr),
+        64 => @sizeOf(elf.Elf64_Phdr),
+        else => unreachable,
+    };
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_phentsize, endian);
+    index += 2;
+
+    const e_phnum = 1;
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_phnum, endian);
+    index += 2;
+
+    const e_shentsize: u16 = switch (ptr_bit_width) {
+        32 => @sizeOf(elf.Elf32_Shdr),
+        64 => @sizeOf(elf.Elf64_Shdr),
+        else => unreachable,
+    };
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_shentsize, endian);
+    index += 2;
+
+    const e_shnum = 0;
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_shnum, endian);
+    index += 2;
+
+    const e_shstrndx = 0;
+    mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_shstrndx, endian);
+    index += 2;
+
+    assert(index == e_ehsize);
 }
 
 fn dumpStdErrUsageAndExit() noreturn {
