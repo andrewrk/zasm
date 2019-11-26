@@ -197,7 +197,7 @@ pub fn main() anyerror!void {
         .target = .Native,
         .input_files = undefined,
         .errors = std.ArrayList(Assembly.Error).init(allocator),
-        .entry_addr = 0x80000000,
+        .entry_addr = 0x8000000,
     };
     var input_files = std.ArrayList([]const u8).init(allocator);
     var maybe_cmd: ?Cmd = null;
@@ -621,7 +621,15 @@ fn assembleExecutable(assembly: *Assembly) !void {
 }
 
 fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
-    const ptr_bit_width = assembly.target.getArchPtrBitWidth();
+    const ptr_width: enum {
+        _32,
+        _64,
+    } = switch (assembly.target.getArchPtrBitWidth()) {
+        32 => ._32,
+        64 => ._64,
+        else => return error.UnsupportedArchitecture,
+    };
+
     const endian = assembly.target.getArch().endian();
     var hdr_buf: [@sizeOf(elf.Elf64_Ehdr) + @sizeOf(elf.Elf64_Phdr)]u8 = undefined;
     var index: usize = 0;
@@ -629,10 +637,9 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
     mem.copy(u8, hdr_buf[index..], "\x7fELF");
     index += 4;
 
-    hdr_buf[index] = switch (ptr_bit_width) {
-        32 => 1,
-        64 => 2,
-        else => return error.UnsupportedArchitecture,
+    hdr_buf[index] = switch (ptr_width) {
+        ._32 => 1,
+        ._64 => 2,
     };
     index += 1;
 
@@ -665,8 +672,8 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
     mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), 1, endian);
     index += 4;
 
-    switch (ptr_bit_width) {
-        32 => {
+    switch (ptr_width) {
+        ._32 => {
             // e_entry
             mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), @intCast(u32, assembly.entry_addr), endian);
             index += 4;
@@ -679,7 +686,7 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
             mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), 0, endian);
             index += 4;
         },
-        64 => {
+        ._64 => {
             // e_entry
             mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), assembly.entry_addr, endian);
             index += 8;
@@ -692,25 +699,22 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
             mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), 0, endian);
             index += 8;
         },
-        else => unreachable,
     }
 
-    // e_flags
-    mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), 0, endian);
+    const e_flags = 0;
+    mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), e_flags, endian);
     index += 4;
 
-    const e_ehsize: u16 = switch (ptr_bit_width) {
-        32 => @sizeOf(elf.Elf32_Ehdr),
-        64 => @sizeOf(elf.Elf64_Ehdr),
-        else => unreachable,
+    const e_ehsize: u16 = switch (ptr_width) {
+        ._32 => @sizeOf(elf.Elf32_Ehdr),
+        ._64 => @sizeOf(elf.Elf64_Ehdr),
     };
     mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_ehsize, endian);
     index += 2;
 
-    const e_phentsize: u16 = switch (ptr_bit_width) {
-        32 => @sizeOf(elf.Elf32_Phdr),
-        64 => @sizeOf(elf.Elf64_Phdr),
-        else => unreachable,
+    const e_phentsize: u16 = switch (ptr_width) {
+        ._32 => @sizeOf(elf.Elf32_Phdr),
+        ._64 => @sizeOf(elf.Elf64_Phdr),
     };
     mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_phentsize, endian);
     index += 2;
@@ -719,10 +723,9 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
     mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_phnum, endian);
     index += 2;
 
-    const e_shentsize: u16 = switch (ptr_bit_width) {
-        32 => @sizeOf(elf.Elf32_Shdr),
-        64 => @sizeOf(elf.Elf64_Shdr),
-        else => unreachable,
+    const e_shentsize: u16 = switch (ptr_width) {
+        ._32 => @sizeOf(elf.Elf32_Shdr),
+        ._64 => @sizeOf(elf.Elf64_Shdr),
     };
     mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_shentsize, endian);
     index += 2;
@@ -736,6 +739,66 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
     index += 2;
 
     assert(index == e_ehsize);
+
+    // Program header
+
+    const p_type = elf.PT_LOAD;
+    mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), p_type, endian);
+    index += 4;
+
+    const machine_code = [_]u8{
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 0x3c
+        0x31, 0xff, // xor edi, edi
+            0x0f, 0x05, // syscall
+    };
+
+    const zeroes = [1]u8{0} ** 0x1000;
+    var pad: usize = undefined;
+
+    switch (ptr_width) {
+        ._32 => @panic("TODO"),
+        ._64 => {
+            const phdr_end = @sizeOf(elf.Elf64_Ehdr) + @sizeOf(elf.Elf64_Phdr);
+            const p_offset = mem.alignForward(phdr_end, 0x1000);
+            pad = p_offset - phdr_end;
+
+            const p_flags = elf.PF_X | elf.PF_R;
+            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), p_flags, endian);
+            index += 4;
+
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_offset, endian);
+            index += 8;
+
+            const p_vaddr = assembly.entry_addr;
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_vaddr, endian);
+            index += 8;
+
+            const p_paddr = assembly.entry_addr;
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_paddr, endian);
+            index += 8;
+
+            const p_filesz = machine_code.len;
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_filesz, endian);
+            index += 8;
+
+            const p_memsz = machine_code.len;
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_memsz, endian);
+            index += 8;
+
+            const p_align = 0x1000;
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_align, endian);
+            index += 8;
+
+            assert(index == phdr_end);
+        },
+        else => unreachable,
+    }
+
+    const file = try std.fs.File.openWriteMode("output", 0o755);
+    defer file.close();
+    try file.write(hdr_buf[0..index]);
+    try file.write(zeroes[0..pad]);
+    try file.write(&machine_code);
 }
 
 fn dumpStdErrUsageAndExit() noreturn {
