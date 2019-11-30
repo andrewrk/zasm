@@ -24,6 +24,7 @@ const Assembly = struct {
     target: std.Target,
     errors: std.ArrayList(Error),
     entry_addr: u64,
+    output_file: ?[]const u8,
 
     pub const SourceInfo = struct {
         token: Token,
@@ -198,6 +199,7 @@ pub fn main() anyerror!void {
         .input_files = undefined,
         .errors = std.ArrayList(Assembly.Error).init(allocator),
         .entry_addr = 0x8000000,
+        .output_file = null,
     };
     var input_files = std.ArrayList([]const u8).init(allocator);
     var maybe_cmd: ?Cmd = null;
@@ -212,13 +214,21 @@ pub fn main() anyerror!void {
             if (mem.eql(u8, arg, "help")) {
                 try dumpUsage(std.io.getStdOut());
                 return;
-            } else if (mem.eql(u8, arg, "target")) {
-                assembly.target = try std.Target.parse(arg);
             } else if (mem.eql(u8, arg, "debug-errors")) {
                 debug_errors = true;
             } else {
-                std.debug.warn("Invalid parameter: {}\n", full_arg);
-                dumpStdErrUsageAndExit();
+                arg_i += 1;
+                if (arg_i >= args.len) {
+                    std.debug.warn("Expected another parameter after '{}'\n", full_arg);
+                    dumpStdErrUsageAndExit();
+                } else if (mem.eql(u8, arg, "target")) {
+                    assembly.target = try std.Target.parse(args[arg_i]);
+                } else if (mem.eql(u8, arg, "o")) {
+                    assembly.output_file = args[arg_i];
+                } else {
+                    std.debug.warn("Invalid parameter: {}\n", full_arg);
+                    dumpStdErrUsageAndExit();
+                }
             }
         } else if (maybe_cmd == null) {
             inline for (std.meta.fields(Cmd)) |field| {
@@ -794,7 +804,12 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
         else => unreachable,
     }
 
-    const file = try std.fs.File.openWriteMode("output", 0o755);
+    const output_file = assembly.output_file orelse blk: {
+        const basename = fs.path.basename(assembly.input_files[0]);
+        const dot_index = mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
+        break :blk basename[0..dot_index];
+    };
+    const file = try std.fs.File.openWriteMode(output_file, 0o755);
     defer file.close();
     try file.write(hdr_buf[0..index]);
     try file.write(zeroes[0..pad]);
@@ -811,16 +826,17 @@ fn dumpUsage(file: fs.File) !void {
         \\Usage: zasm [command] [options]
         \\
         \\Commands:
-        \\  exe                  create an executable file
-        \\  obj                  create an object file
-        \\  dis                  disassemble a binary into source
+        \\  exe [files]          create an executable file
+        \\  obj [files]          create an object file
+        \\  dis [file]           disassemble a binary into source
         \\  targets              list the supported targets to stdout
-        \\  tokenize             (debug) tokenize the input files
+        \\  tokenize [file]      (debug) tokenize the input files
         \\
         \\Options:
+        \\  -o [file]            override output file name
         \\  -help                dump this help text to stdout
         \\  -target [arch]-[os]  specify the target for positional arguments
-        \\  -debug-errors        show stack trace on error
+        \\  -debug-errors        (debug) show stack trace on error
         \\
     );
 }
