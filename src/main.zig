@@ -187,9 +187,8 @@ const Section = struct {
 };
 
 const Symbol = struct {
-    /// Relative to the containing Section
     /// `undefined` until a second pass when addresses are calculated.
-    addr_offset: u64,
+    addr: u64,
 
     /// Starts at 0. Increments with instructions being added.
     size: u64,
@@ -203,10 +202,6 @@ const Symbol = struct {
 
 const Instruction = struct {
     props: *const data.Instruction,
-
-    /// Relative to the containing Symbol
-    addr_offset: u64,
-
     args: []Arg,
 };
 
@@ -447,7 +442,7 @@ const AsmFile = struct {
         };
         const symbol = try self.symbols.allocator.create(Symbol);
         symbol.* = Symbol{
-            .addr_offset = undefined,
+            .addr = undefined,
             .size = 0,
             .source_token = source_token,
             .name = name,
@@ -671,7 +666,6 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         try current_symbol.ops.append(.{
                             .instruction = .{
                                 .props = inst,
-                                .addr_offset = current_symbol.size,
                                 .args = args.toSliceConst(),
                             },
                         });
@@ -726,25 +720,42 @@ fn assembleExecutable(assembly: *Assembly) !void {
 
         try file.seekTo(assembly.file_offset);
         const prev_file_offset = assembly.file_offset;
-        section.mem_size = try writeSection(assembly, section, file, ptr_width);
+        const prev_map_addr = assembly.next_map_addr;
+        try writeSection(assembly, section, file, ptr_width);
         section.file_size = assembly.file_offset - prev_file_offset;
-        assembly.next_map_addr += section.mem_size;
+        section.mem_size = assembly.next_map_addr - prev_map_addr;
     }
 
     try file.seekTo(0);
     try writeElfHeader(assembly, file, ptr_width, &section_names);
 }
 
-fn writeSection(assembly: *Assembly, section: *Section, file: fs.File, ptr_width: PtrWidth) error{}!u64 {
-    var mem_size: u64 = 0;
+fn writeSection(assembly: *Assembly, section: *Section, file: fs.File, ptr_width: PtrWidth) !void {
     for (section.layout.toSliceConst()) |symbol| {
+        symbol.addr = assembly.next_map_addr;
+
         for (symbol.ops.toSliceConst()) |pseudo_op| {
             switch (pseudo_op) {
                 .instruction => |inst| {
-                    @panic("handle instruction pseudo op");
+                    // TODO clearly this is not how instruction selection is supposed to work
+                    var slice: []const u8 = undefined;
+                    if (mem.eql(u8, inst.props.name, "mov")) {
+                        slice = &[_]u8{ 0xb8, 0x3c, 0x00, 0x00, 0x00 }; // mov eax, 0x3c
+                    } else if (mem.eql(u8, inst.props.name, "xor")) {
+                        slice = &[_]u8{ 0x31, 0xff }; // xor edi, edi
+                    } else if (mem.eql(u8, inst.props.name, "syscall")) {
+                        slice = &[_]u8{ 0x0f, 0x05 }; // syscall
+                    } else {
+                        @panic("TODO");
+                    }
+                    try file.write(slice);
+                    assembly.next_map_addr += slice.len;
+                    assembly.file_offset += slice.len;
                 },
-                .data => {
-                    @panic("handle data pseudo op");
+                .data => |slice| {
+                    try file.write(slice);
+                    assembly.next_map_addr += slice.len;
+                    assembly.file_offset += slice.len;
                 },
             }
         }
@@ -752,11 +763,10 @@ fn writeSection(assembly: *Assembly, section: *Section, file: fs.File, ptr_width
             if (assembly.entry_addr) |prev_addr| {
                 @panic("TODO emit error for _start already defined");
             } else {
-                assembly.entry_addr = symbol.addr_offset;
+                assembly.entry_addr = symbol.addr;
             }
         }
     }
-    return mem_size;
 }
 
 const PtrWidth = enum {
@@ -887,7 +897,6 @@ fn writeElfHeader(
     for (section_names) |section_name| {
         const section = (assembly.sections.get(section_name) orelse break).value;
 
-        try file.seekTo(section.file_offset);
         index = 0;
 
         const p_type = elf.PT_LOAD;
