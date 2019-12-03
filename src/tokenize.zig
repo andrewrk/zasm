@@ -16,6 +16,7 @@ pub const Token = struct {
         colon,
         comma,
         line_comment,
+        line_break,
         period,
         slash,
         eof,
@@ -63,6 +64,7 @@ pub const Tokenizer = struct {
         string_literal,
         string_literal_backslash,
         zero,
+        line_break,
     };
 
     pub fn next(self: *Tokenizer) Token {
@@ -83,8 +85,12 @@ pub const Tokenizer = struct {
             const c = self.buffer[self.index];
             switch (state) {
                 .start => switch (c) {
-                    ' ', '\n', '\t', '\r' => {
+                    ' ', '\t', '\r' => {
                         result.start = self.index + 1;
+                    },
+                    '\n' => {
+                        result.id = .line_break;
+                        state = .line_break;
                     },
                     '"' => {
                         state = .string_literal;
@@ -128,6 +134,11 @@ pub const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
+                },
+
+                .line_break => switch (c) {
+                    '\n', '\r' => {},
+                    else => break,
                 },
 
                 .identifier => switch (c) {
@@ -401,6 +412,7 @@ pub const Tokenizer = struct {
                 .float_fraction_hex,
                 .float_exponent_number,
                 .float_exponent_number_hex,
+                .line_break,
                 .string_literal, // find this error later
                 => {},
 

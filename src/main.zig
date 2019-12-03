@@ -70,6 +70,9 @@ const Assembly = struct {
             bad_index: usize,
             bad_byte: u8,
         },
+        too_many_args: struct {
+            source_info: SourceInfo,
+        },
 
         fn printToStream(stream: var, comptime message: []const u8, source_info: SourceInfo, args: ...) !void {
             const loc = tokenLocation(source_info.source, source_info.token);
@@ -105,7 +108,7 @@ const Assembly = struct {
                     const si = info.source_info;
                     try printToStream(
                         stream,
-                        "error: unrecognized instruction: {}\n",
+                        "error: instruction name or parameters do not match asm database: {}\n",
                         si,
                         si.source[si.token.start..si.token.end],
                     );
@@ -168,6 +171,14 @@ const Assembly = struct {
                         si.file_name,
                         other_loc.line + 1,
                         other_loc.column + 1,
+                    );
+                },
+                .too_many_args => |info| {
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: too many args\n",
+                        si,
                     );
                 },
             }
@@ -521,8 +532,8 @@ fn assembleExecutable(assembly: *Assembly) !void {
 
     assembly.asm_files = try assembly.allocator.alloc(AsmFile, assembly.input_files.len);
 
-    for (assembly.input_files) |input_file, i| {
-        const asm_file = &assembly.asm_files[i];
+    for (assembly.input_files) |input_file, input_file_index| {
+        const asm_file = &assembly.asm_files[input_file_index];
         asm_file.* = .{
             .assembly = assembly,
             .file_name = input_file,
@@ -537,18 +548,21 @@ fn assembleExecutable(assembly: *Assembly) !void {
         while (true) {
             const token = asm_file.nextToken();
             switch (token.id) {
+                .line_break => continue,
                 .eof => break,
                 .period => {
                     const dir_ident = try asm_file.expectToken(.identifier);
                     const dir_name = asm_file.tokenSlice(dir_ident);
                     if (mem.eql(u8, dir_name, "text")) {
                         try asm_file.setCurrentSection("text", elf.PF_R | elf.PF_X);
+                        _ = try asm_file.expectToken(.line_break);
                     } else if (mem.eql(u8, dir_name, "globl")) {
                         while (true) {
                             const ident = try asm_file.expectToken(.identifier);
                             try asm_file.addGlobal(asm_file.tokenSlice(ident));
                             if (asm_file.eatToken(.comma)) |_| continue else break;
                         }
+                        _ = try asm_file.expectToken(.line_break);
                     } else if (mem.eql(u8, dir_name, "section")) {
                         _ = try asm_file.expectToken(.period);
                         const sect_name_token = try asm_file.expectToken(.identifier);
@@ -556,6 +570,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         _ = try asm_file.expectToken(.comma);
                         const flags_tok = try asm_file.expectToken(.string_literal);
                         try asm_file.setCurrentSectionFlagsTok(sect_name, flags_tok);
+                        _ = try asm_file.expectToken(.line_break);
                     } else if (mem.eql(u8, dir_name, "ascii")) {
                         const current_symbol = try asm_file.getCurrentSymbol(dir_ident);
 
@@ -581,6 +596,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
 
                         try current_symbol.ops.append(.{ .data = bytes });
                         current_symbol.size += bytes.len;
+                        _ = try asm_file.expectToken(.line_break);
                     } else {
                         try assembly.errors.append(.{
                             .unrecognized_directive = .{ .source_info = newSourceInfo(asm_file, dir_ident) },
@@ -593,11 +609,46 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         const symbol_name = asm_file.tokenSlice(token);
                         try asm_file.beginSymbol(token, symbol_name);
                     } else {
-                        const wanted_instr_name = asm_file.tokenSlice(token);
-                        const inst = for (data.instructions) |*inst| {
-                            if (mem.eql(u8, inst.name, wanted_instr_name)) {
-                                break inst;
+                        var arg_toks: [2]Token = undefined;
+                        var arg_count: usize = 0;
+                        var last_comma_tok: Token = undefined;
+                        while (arg_count < arg_toks.len) {
+                            const tok = asm_file.nextToken();
+                            if (tok.id == .line_break) break;
+
+                            arg_toks[arg_count] = tok;
+                            arg_count += 1;
+
+                            if (asm_file.eatToken(.comma)) |comma_tok| {
+                                last_comma_tok = comma_tok;
+                                continue;
+                            } else {
+                                break;
                             }
+                        } else {
+                            try assembly.errors.append(.{
+                                .too_many_args = .{ .source_info = newSourceInfo(asm_file, last_comma_tok) },
+                            });
+                            return error.ParseFailure;
+                        }
+
+                        const wanted_instr_name = asm_file.tokenSlice(token);
+                        const inst = outer: for (data.instructions) |*inst| {
+                            if (!mem.eql(u8, inst.name, wanted_instr_name)) continue;
+                            if (inst.args.len != arg_count) continue;
+                            for (inst.args) |inst_arg, i| switch (inst_arg) {
+                                .register => |reg| {
+                                    if (arg_toks[i].id != .identifier) continue :outer;
+                                    const src_reg_name = asm_file.tokenSlice(arg_toks[i]);
+                                    // TODO validate register name
+                                    if (!mem.eql(u8, src_reg_name, @tagName(reg))) continue :outer;
+                                },
+                                .immediate => switch (arg_toks[i].id) {
+                                    .integer_literal, .char_literal, .identifier => {},
+                                    else => continue :outer,
+                                },
+                            };
+                            break :outer inst;
                         } else {
                             try assembly.errors.append(.{
                                 .unrecognized_instruction = .{ .source_info = newSourceInfo(asm_file, token) },
@@ -605,16 +656,8 @@ fn assembleExecutable(assembly: *Assembly) !void {
                             return error.ParseFailure;
                         };
                         const current_symbol = try asm_file.getCurrentSymbol(token);
-                        var args_left: usize = inst.args.len;
-                        var first = true;
                         var args = std.ArrayList(Arg).init(assembly.allocator);
-                        while (args_left != 0) : (args_left -= 1) {
-                            if (first) {
-                                first = false;
-                            } else {
-                                _ = try asm_file.expectToken(.comma);
-                            }
-                            const arg_token = asm_file.nextToken();
+                        for (arg_toks[0..arg_count]) |arg_token| {
                             const arg_text = asm_file.tokenSlice(arg_token);
                             var arg: Arg = undefined;
                             switch (arg_token.id) {
