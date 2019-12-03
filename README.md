@@ -1,6 +1,8 @@
 # zasm
 
-Multi-target assembler and disassembler.
+Multi-target assembler, disassembler, and linker.
+
+This is my experimental playground for a non-LLVM Zig backend.
 
 ## Status
 
@@ -27,3 +29,22 @@ of stable release that includes a specification, it is in scope.
  * ELF
  * PE (Portable Executable) (Windows)
  * WebAssembly
+
+### Debug Info Formats
+
+ * DWARF
+ * PDB
+
+## Roadmap
+
+ * Hello world x86_64 assembly with 1 file
+ * Hello world x86_64 assembly split across 2 files
+ * Hello world aarch64 assembly
+ * Hello world i386 assembly
+ * Tests
+ * Symbol table
+ * DWARF Debug Info
+ * Support more instructions
+ * Build objects
+ * Link objects
+ * Incremental linking

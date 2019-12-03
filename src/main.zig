@@ -21,10 +21,16 @@ const Cmd = enum {
 const Assembly = struct {
     allocator: *mem.Allocator,
     input_files: []const []const u8,
+    asm_files: []AsmFile,
     target: std.Target,
     errors: std.ArrayList(Error),
-    entry_addr: u64,
+    entry_addr: ?u64 = null,
     output_file: ?[]const u8,
+    file_offset: u64,
+    next_map_addr: u64 = 0x10000,
+    sections: SectionTable,
+
+    const SectionTable = std.StringHashMap(*Section);
 
     pub const SourceInfo = struct {
         token: Token,
@@ -58,6 +64,11 @@ const Assembly = struct {
         bad_string_literal: struct {
             source_info: SourceInfo,
             bad_index: usize,
+        },
+        bad_section_flag: struct {
+            source_info: SourceInfo,
+            bad_index: usize,
+            bad_byte: u8,
         },
 
         fn printToStream(stream: var, comptime message: []const u8, source_info: SourceInfo, args: ...) !void {
@@ -118,13 +129,22 @@ const Assembly = struct {
                     );
                 },
                 .bad_string_literal => |info| {
-                    const si = info.source_info;
-                    try printToStream(
-                        stream,
-                        "error: invalid string literal at index {}: {}\n",
-                        si,
-                        info.bad_index,
-                        si.source[si.token.start..si.token.end],
+                    const loc = tokenLocation(info.source_info.source, info.source_info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: invalid byte in string literal\n",
+                        info.source_info.file_name,
+                        loc.line + 1,
+                        loc.column + 1 + info.bad_index,
+                    );
+                },
+                .bad_section_flag => |info| {
+                    const loc = tokenLocation(info.source_info.source, info.source_info.token);
+                    try stream.print(
+                        "{}:{}:{}: error: invalid section flag: '{c}'\n",
+                        info.source_info.file_name,
+                        loc.line + 1,
+                        loc.column + 1 + info.bad_index,
+                        info.bad_byte,
                     );
                 },
                 .instr_outside_symbol => |info| {
@@ -153,6 +173,46 @@ const Assembly = struct {
             }
         }
     };
+};
+
+const Section = struct {
+    name: []const u8,
+    layout: std.ArrayList(*Symbol),
+    alignment: u32,
+    file_offset: u64,
+    file_size: u64,
+    virt_addr: u64,
+    mem_size: u64,
+    flags: u32,
+};
+
+const Symbol = struct {
+    /// Relative to the containing Section
+    /// `undefined` until a second pass when addresses are calculated.
+    addr_offset: u64,
+
+    /// Starts at 0. Increments with instructions being added.
+    size: u64,
+
+    source_token: Token,
+    name: []const u8,
+    section: *Section,
+
+    ops: std.ArrayList(PseudoOp),
+};
+
+const Instruction = struct {
+    props: *const data.Instruction,
+
+    /// Relative to the containing Symbol
+    addr_offset: u64,
+
+    args: []Arg,
+};
+
+const PseudoOp = union(enum) {
+    instruction: Instruction,
+    data: []const u8,
 };
 
 const Location = struct {
@@ -198,8 +258,10 @@ pub fn main() anyerror!void {
         .target = .Native,
         .input_files = undefined,
         .errors = std.ArrayList(Assembly.Error).init(allocator),
-        .entry_addr = 0x8000000,
         .output_file = null,
+        .sections = Assembly.SectionTable.init(allocator),
+        .asm_files = undefined,
+        .file_offset = 0,
     };
     var input_files = std.ArrayList([]const u8).init(allocator);
     var maybe_cmd: ?Cmd = null;
@@ -285,7 +347,7 @@ pub fn main() anyerror!void {
         },
         .tokenize => {
             const stdout = &std.io.getStdOut().outStream().stream;
-            const cwd = fs.Dir.cwd();
+            const cwd = fs.cwd();
             for (input_files.toSliceConst()) |input_file| {
                 const source = try cwd.readFileAlloc(allocator, input_file, math.maxInt(usize));
                 var tokenizer = Tokenizer.init(source);
@@ -312,70 +374,68 @@ const AsmFile = struct {
     assembly: *Assembly,
     current_section: ?*Section = null,
     current_symbol: ?*Symbol = null,
-    sections: SectionTable,
     globals: GlobalSet,
     put_back_buffer: [1]Token,
     put_back_count: u1,
     symbols: SymbolTable,
 
-    const SectionTable = std.StringHashMap(*Section);
     const SymbolTable = std.StringHashMap(*Symbol);
     const GlobalSet = std.StringHashMap(void);
-
-    const Section = struct {
-        name: []const u8,
-        layout: std.ArrayList(*Symbol),
-    };
-
-    const Instruction = struct {
-        props: *const data.Instruction,
-
-        /// Relative to the containing Symbol
-        addr_offset: u64,
-
-        args: []Arg,
-    };
-
-    const Symbol = struct {
-        /// Relative to the containing Section
-        /// `undefined` until a second pass when addresses are calculated.
-        addr_offset: u64,
-
-        /// Starts at 0. Increments with instructions being added.
-        size: u64,
-
-        source_token: Token,
-        name: []const u8,
-        section: *Section,
-
-        ops: std.ArrayList(PseudoOp),
-    };
-
-    const PseudoOp = union(enum) {
-        instruction: Instruction,
-        data: []const u8,
-    };
 
     fn tokenSlice(asm_file: AsmFile, token: Token) []const u8 {
         return asm_file.source[token.start..token.end];
     }
 
-    fn findOrCreateSection(self: *AsmFile, name: []const u8) !*Section {
-        const gop = try self.sections.getOrPut(name);
+    fn findOrCreateSection(self: *AsmFile, name: []const u8, flags: u32) !*Section {
+        const gop = try self.assembly.sections.getOrPut(name);
         if (gop.found_existing) {
+            // TODO deal with flags conflicts
             return gop.kv.value;
         }
-        const section = try self.sections.allocator.create(Section);
+        const section = try self.assembly.sections.allocator.create(Section);
         section.* = Section{
             .name = name,
-            .layout = std.ArrayList(*Symbol).init(self.sections.allocator),
+            .layout = std.ArrayList(*Symbol).init(self.assembly.sections.allocator),
+            .alignment = 0x1000,
+            .file_offset = undefined,
+            .file_size = 0,
+            .virt_addr = undefined,
+            .mem_size = 0,
+            .flags = flags,
         };
         gop.kv.value = section;
         return section;
     }
 
-    fn setCurrentSection(self: *AsmFile, name: []const u8) !void {
-        self.current_section = try self.findOrCreateSection("text");
+    fn setCurrentSection(self: *AsmFile, name: []const u8, flags: u32) !void {
+        const section = try self.findOrCreateSection(name, flags);
+        self.current_section = section;
+    }
+
+    fn setCurrentSectionFlagsTok(self: *AsmFile, name: []const u8, flags_tok: Token) !void {
+        var flags: u32 = 0;
+        const flags_str = blk: {
+            const tok_slice = self.tokenSlice(flags_tok);
+            // skip over the double quotes
+            break :blk tok_slice[1 .. tok_slice.len - 1];
+        };
+        for (flags_str) |b, offset| switch (b) {
+            'a', 'r' => flags |= elf.PF_R,
+            'w' => flags |= elf.PF_W,
+            'x' => flags |= elf.PF_X,
+            else => {
+                try self.assembly.errors.append(.{
+                    .bad_section_flag = .{
+                        .source_info = newSourceInfo(self, flags_tok),
+                        .bad_index = offset,
+                        .bad_byte = b,
+                    },
+                });
+                return error.ParseFailure;
+            },
+        };
+
+        return self.setCurrentSection(name, flags);
     }
 
     fn beginSymbol(self: *AsmFile, source_token: Token, name: []const u8) !void {
@@ -462,13 +522,15 @@ fn newSourceInfo(asm_file: *AsmFile, tok: Token) Assembly.SourceInfo {
 }
 
 fn assembleExecutable(assembly: *Assembly) !void {
-    const cwd = fs.Dir.cwd();
+    const cwd = fs.cwd();
 
-    for (assembly.input_files) |input_file| {
-        var asm_file = AsmFile{
+    assembly.asm_files = try assembly.allocator.alloc(AsmFile, assembly.input_files.len);
+
+    for (assembly.input_files) |input_file, i| {
+        const asm_file = &assembly.asm_files[i];
+        asm_file.* = .{
             .assembly = assembly,
             .file_name = input_file,
-            .sections = AsmFile.SectionTable.init(assembly.allocator),
             .globals = AsmFile.GlobalSet.init(assembly.allocator),
             .symbols = AsmFile.SymbolTable.init(assembly.allocator),
             .source = try cwd.readFileAlloc(assembly.allocator, input_file, math.maxInt(usize)),
@@ -485,7 +547,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                     const dir_ident = try asm_file.expectToken(.identifier);
                     const dir_name = asm_file.tokenSlice(dir_ident);
                     if (mem.eql(u8, dir_name, "text")) {
-                        try asm_file.setCurrentSection("text");
+                        try asm_file.setCurrentSection("text", elf.PF_R | elf.PF_X);
                     } else if (mem.eql(u8, dir_name, "globl")) {
                         while (true) {
                             const ident = try asm_file.expectToken(.identifier);
@@ -496,10 +558,9 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         _ = try asm_file.expectToken(.period);
                         const sect_name_token = try asm_file.expectToken(.identifier);
                         const sect_name = asm_file.tokenSlice(sect_name_token);
-                        try asm_file.setCurrentSection(sect_name);
                         _ = try asm_file.expectToken(.comma);
-                        // TODO support this string literal doing anything
-                        _ = try asm_file.expectToken(.string_literal);
+                        const flags_tok = try asm_file.expectToken(.string_literal);
+                        try asm_file.setCurrentSectionFlagsTok(sect_name, flags_tok);
                     } else if (mem.eql(u8, dir_name, "ascii")) {
                         const current_symbol = try asm_file.getCurrentSymbol(dir_ident);
 
@@ -514,7 +575,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                             error.InvalidCharacter => {
                                 try assembly.errors.append(.{
                                     .bad_string_literal = .{
-                                        .source_info = newSourceInfo(&asm_file, str_lit_tok),
+                                        .source_info = newSourceInfo(asm_file, str_lit_tok),
                                         .bad_index = bad_index,
                                     },
                                 });
@@ -527,7 +588,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                         current_symbol.size += bytes.len;
                     } else {
                         try assembly.errors.append(.{
-                            .unrecognized_directive = .{ .source_info = newSourceInfo(&asm_file, dir_ident) },
+                            .unrecognized_directive = .{ .source_info = newSourceInfo(asm_file, dir_ident) },
                         });
                         return error.ParseFailure;
                     }
@@ -544,7 +605,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                             }
                         } else {
                             try assembly.errors.append(.{
-                                .unrecognized_instruction = .{ .source_info = newSourceInfo(&asm_file, token) },
+                                .unrecognized_instruction = .{ .source_info = newSourceInfo(asm_file, token) },
                             });
                             return error.ParseFailure;
                         };
@@ -580,7 +641,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                                     }
                                     const imm = std.fmt.parseUnsigned(u64, text, base) catch |err| {
                                         try asm_file.assembly.errors.append(.{
-                                            .bad_integer_literal = .{ .source_info = newSourceInfo(&asm_file, arg_token) },
+                                            .bad_integer_literal = .{ .source_info = newSourceInfo(asm_file, arg_token) },
                                         });
                                         return error.ParseFailure;
                                     };
@@ -599,7 +660,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                                 },
                                 else => {
                                     try asm_file.assembly.errors.append(.{
-                                        .unexpected_token = .{ .source_info = newSourceInfo(&asm_file, arg_token) },
+                                        .unexpected_token = .{ .source_info = newSourceInfo(asm_file, arg_token) },
                                     });
                                     return error.ParseFailure;
                                 },
@@ -619,29 +680,99 @@ fn assembleExecutable(assembly: *Assembly) !void {
                 },
                 else => {
                     try assembly.errors.append(.{
-                        .unexpected_token = .{ .source_info = newSourceInfo(&asm_file, token) },
+                        .unexpected_token = .{ .source_info = newSourceInfo(asm_file, token) },
                     });
                     return error.ParseFailure;
                 },
             }
         }
-
-        try assembleExePass2(assembly, &asm_file);
     }
-}
 
-fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
-    const ptr_width: enum {
-        _32,
-        _64,
-    } = switch (assembly.target.getArchPtrBitWidth()) {
+    const output_file = assembly.output_file orelse blk: {
+        const basename = fs.path.basename(assembly.input_files[0]);
+        const dot_index = mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
+        break :blk basename[0..dot_index];
+    };
+    const file = try std.fs.cwd().createFile(output_file, .{
+        .mode = 0o755,
+        .truncate = false,
+    });
+    defer file.close();
+
+    const ptr_width: PtrWidth = switch (assembly.target.getArchPtrBitWidth()) {
         32 => ._32,
         64 => ._64,
         else => return error.UnsupportedArchitecture,
     };
+    const ehdr_size: u64 = switch (ptr_width) {
+        ._32 => @sizeOf(elf.Elf32_Ehdr),
+        ._64 => @sizeOf(elf.Elf64_Ehdr),
+    };
+    const phdr_size: u64 = switch (ptr_width) {
+        ._32 => @sizeOf(elf.Elf32_Phdr),
+        ._64 => @sizeOf(elf.Elf64_Phdr),
+    };
+    const section_names = [_][]const u8{ "rodata", "text" };
+    assembly.file_offset = ehdr_size + phdr_size * section_names.len;
 
+    for (section_names) |section_name| {
+        const section = (assembly.sections.get(section_name) orelse break).value;
+
+        assembly.file_offset = mem.alignForward(assembly.file_offset, section.alignment);
+        assembly.next_map_addr = mem.alignForward(assembly.next_map_addr, section.alignment);
+
+        section.file_offset = assembly.file_offset;
+        section.virt_addr = assembly.next_map_addr;
+
+        try file.seekTo(assembly.file_offset);
+        const prev_file_offset = assembly.file_offset;
+        section.mem_size = try writeSection(assembly, section, file, ptr_width);
+        section.file_size = assembly.file_offset - prev_file_offset;
+        assembly.next_map_addr += section.mem_size;
+    }
+
+    try file.seekTo(0);
+    try writeElfHeader(assembly, file, ptr_width, &section_names);
+}
+
+fn writeSection(assembly: *Assembly, section: *Section, file: fs.File, ptr_width: PtrWidth) error{}!u64 {
+    var mem_size: u64 = 0;
+    for (section.layout.toSliceConst()) |symbol| {
+        for (symbol.ops.toSliceConst()) |pseudo_op| {
+            switch (pseudo_op) {
+                .instruction => |inst| {
+                    @panic("handle instruction pseudo op");
+                },
+                .data => {
+                    @panic("handle data pseudo op");
+                },
+            }
+        }
+        if (mem.eql(u8, symbol.name, "_start")) {
+            if (assembly.entry_addr) |prev_addr| {
+                @panic("TODO emit error for _start already defined");
+            } else {
+                assembly.entry_addr = symbol.addr_offset;
+            }
+        }
+    }
+    return mem_size;
+}
+
+const PtrWidth = enum {
+    _32,
+    _64,
+};
+
+fn writeElfHeader(
+    assembly: *Assembly,
+    /// Expected to be already seeked to position 0 in the file.
+    file: fs.File,
+    ptr_width: PtrWidth,
+    section_names: []const []const u8,
+) !void {
     const endian = assembly.target.getArch().endian();
-    var hdr_buf: [@sizeOf(elf.Elf64_Ehdr) + @sizeOf(elf.Elf64_Phdr)]u8 = undefined;
+    var hdr_buf: [math.max(@sizeOf(elf.Elf64_Ehdr), @sizeOf(elf.Elf64_Phdr))]u8 = undefined;
     var index: usize = 0;
 
     mem.copy(u8, hdr_buf[index..], "\x7fELF");
@@ -685,7 +816,7 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
     switch (ptr_width) {
         ._32 => {
             // e_entry
-            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), @intCast(u32, assembly.entry_addr), endian);
+            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), @intCast(u32, assembly.entry_addr.?), endian);
             index += 4;
 
             // e_phoff
@@ -698,7 +829,7 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
         },
         ._64 => {
             // e_entry
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), assembly.entry_addr, endian);
+            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), assembly.entry_addr.?, endian);
             index += 8;
 
             // e_phoff
@@ -729,7 +860,7 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
     mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_phentsize, endian);
     index += 2;
 
-    const e_phnum = 1;
+    const e_phnum = @intCast(u16, section_names.len);
     mem.writeInt(u16, @ptrCast(*[2]u8, &hdr_buf[index]), e_phnum, endian);
     index += 2;
 
@@ -750,70 +881,49 @@ fn assembleExePass2(assembly: *Assembly, asm_file: *AsmFile) !void {
 
     assert(index == e_ehsize);
 
-    // Program header
-
-    const p_type = elf.PT_LOAD;
-    mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), p_type, endian);
-    index += 4;
-
-    const machine_code = [_]u8{
-        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 0x3c
-        0x31, 0xff, // xor edi, edi
-            0x0f, 0x05, // syscall
-    };
-
-    const zeroes = [1]u8{0} ** 0x1000;
-    var pad: usize = undefined;
-
-    switch (ptr_width) {
-        ._32 => @panic("TODO"),
-        ._64 => {
-            const phdr_end = @sizeOf(elf.Elf64_Ehdr) + @sizeOf(elf.Elf64_Phdr);
-            const p_offset = mem.alignForward(phdr_end, 0x1000);
-            pad = p_offset - phdr_end;
-
-            const p_flags = elf.PF_X | elf.PF_R;
-            mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), p_flags, endian);
-            index += 4;
-
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_offset, endian);
-            index += 8;
-
-            const p_vaddr = assembly.entry_addr;
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_vaddr, endian);
-            index += 8;
-
-            const p_paddr = assembly.entry_addr;
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_paddr, endian);
-            index += 8;
-
-            const p_filesz = machine_code.len;
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_filesz, endian);
-            index += 8;
-
-            const p_memsz = machine_code.len;
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_memsz, endian);
-            index += 8;
-
-            const p_align = 0x1000;
-            mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), p_align, endian);
-            index += 8;
-
-            assert(index == phdr_end);
-        },
-        else => unreachable,
-    }
-
-    const output_file = assembly.output_file orelse blk: {
-        const basename = fs.path.basename(assembly.input_files[0]);
-        const dot_index = mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
-        break :blk basename[0..dot_index];
-    };
-    const file = try std.fs.File.openWriteMode(output_file, 0o755);
-    defer file.close();
     try file.write(hdr_buf[0..index]);
-    try file.write(zeroes[0..pad]);
-    try file.write(&machine_code);
+
+    // Program headers
+    for (section_names) |section_name| {
+        const section = (assembly.sections.get(section_name) orelse break).value;
+
+        try file.seekTo(section.file_offset);
+        index = 0;
+
+        const p_type = elf.PT_LOAD;
+        mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), p_type, endian);
+        index += 4;
+
+        switch (ptr_width) {
+            ._32 => @panic("TODO"),
+            ._64 => {
+                mem.writeInt(u32, @ptrCast(*[4]u8, &hdr_buf[index]), section.flags, endian);
+                index += 4;
+
+                mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), section.file_offset, endian);
+                index += 8;
+
+                mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), section.virt_addr, endian);
+                index += 8;
+
+                mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), section.virt_addr, endian);
+                index += 8;
+
+                mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), section.file_size, endian);
+                index += 8;
+
+                mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), section.mem_size, endian);
+                index += 8;
+
+                mem.writeInt(u64, @ptrCast(*[8]u8, &hdr_buf[index]), section.alignment, endian);
+                index += 8;
+            },
+            else => unreachable,
+        }
+
+        assert(index == e_phentsize);
+        try file.write(hdr_buf[0..index]);
+    }
 }
 
 fn dumpStdErrUsageAndExit() noreturn {
