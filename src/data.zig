@@ -1,7 +1,8 @@
 pub const Instruction = struct {
     /// Primary opcode
     po: u8,
-    prefix: bool = false,
+    prefix: ?u8 = null,
+    suffix: ?u8 = null,
     name: []const u8,
     args: []const Arg,
     size: u64,
@@ -58,14 +59,15 @@ pub const instructions = [_]Instruction{
     },
     .{
         .name = "syscall",
-        .po = 0xba,
-        .prefix = true,
+        .po = 0x05,
+        .prefix = 0x0f,
         .args = &[_]Arg{},
         .size = 2,
     },
     .{
         .name = "xor",
         .po = 0x31,
+        .suffix = 0xff,
         .args = &[_]Arg{
             .{ .register = .edi },
             .{ .register = .edi },

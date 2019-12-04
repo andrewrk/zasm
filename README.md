@@ -37,9 +37,8 @@ of stable release that includes a specification, it is in scope.
 
 ## Roadmap
 
- * Hello world x86_64 assembly with 1 file
- * Hello world x86_64 assembly split across 2 files
  * Hello world aarch64 assembly
+ * Hello world x86_64 assembly split across 2 files
  * Hello world i386 assembly
  * Tests
  * Symbol table

@@ -73,6 +73,9 @@ const Assembly = struct {
         too_many_args: struct {
             source_info: SourceInfo,
         },
+        unknown_symbol: struct {
+            source_info: SourceInfo,
+        },
 
         fn printToStream(stream: var, comptime message: []const u8, source_info: SourceInfo, args: ...) !void {
             const loc = tokenLocation(source_info.source, source_info.token);
@@ -181,6 +184,14 @@ const Assembly = struct {
                         si,
                     );
                 },
+                .unknown_symbol => |info| {
+                    const si = info.source_info;
+                    try printToStream(
+                        stream,
+                        "error: unknown symbol\n",
+                        si,
+                    );
+                },
             }
         }
     };
@@ -209,6 +220,8 @@ const Symbol = struct {
     section: *Section,
 
     ops: std.ArrayList(PseudoOp),
+
+    source_file: *AsmFile,
 };
 
 const Instruction = struct {
@@ -370,7 +383,7 @@ pub fn main() anyerror!void {
 const Arg = union(enum) {
     register: data.Register,
     immediate: u64,
-    symbol_ref: []const u8,
+    symbol_ref: Token,
 };
 
 const AsmFile = struct {
@@ -459,6 +472,7 @@ const AsmFile = struct {
             .name = name,
             .section = current_section,
             .ops = std.ArrayList(PseudoOp).init(self.assembly.allocator),
+            .source_file = self,
         };
         if (try self.symbols.put(name, symbol)) |existing_entry| {
             try self.assembly.errors.append(.{
@@ -693,7 +707,7 @@ fn assembleExecutable(assembly: *Assembly) !void {
                                             break;
                                         }
                                     } else {
-                                        arg = Arg{ .symbol_ref = arg_text };
+                                        arg = Arg{ .symbol_ref = arg_token };
                                     }
                                 },
                                 else => {
@@ -774,26 +788,55 @@ fn assembleExecutable(assembly: *Assembly) !void {
 }
 
 fn writeSection(assembly: *Assembly, section: *Section, file: fs.File, ptr_width: PtrWidth) !void {
+    const endian = assembly.target.getArch().endian();
+
     for (section.layout.toSliceConst()) |symbol| {
         symbol.addr = assembly.next_map_addr;
 
         for (symbol.ops.toSliceConst()) |pseudo_op| {
             switch (pseudo_op) {
                 .instruction => |inst| {
-                    // TODO clearly this is not how instruction selection is supposed to work
-                    var slice: []const u8 = undefined;
-                    if (mem.eql(u8, inst.props.name, "mov")) {
-                        slice = &[_]u8{ 0xb8, 0x3c, 0x00, 0x00, 0x00 }; // mov eax, 0x3c
-                    } else if (mem.eql(u8, inst.props.name, "xor")) {
-                        slice = &[_]u8{ 0x31, 0xff }; // xor edi, edi
-                    } else if (mem.eql(u8, inst.props.name, "syscall")) {
-                        slice = &[_]u8{ 0x0f, 0x05 }; // syscall
-                    } else {
-                        @panic("TODO");
+                    var buf: [8]u8 = undefined;
+                    var index: usize = 0;
+                    if (inst.props.prefix) |prefix| {
+                        buf[index] = prefix;
+                        index += 1;
                     }
-                    try file.write(slice);
-                    assembly.next_map_addr += slice.len;
-                    assembly.file_offset += slice.len;
+                    buf[index] = inst.props.po;
+                    index += 1;
+
+                    for (inst.args) |arg| switch (arg) {
+                        .register => {},
+                        .immediate => |x| {
+                            mem.writeInt(u32, @ptrCast(*[4]u8, &buf[index]), @intCast(u32, x), endian);
+                            index += 4;
+                        },
+                        .symbol_ref => |other_sym_tok| {
+                            const other_sym_name = symbol.source_file.tokenSlice(other_sym_tok);
+                            const other_symbol = symbol.source_file.symbols.getValue(other_sym_name) orelse {
+                                try assembly.errors.append(.{
+                                    .unknown_symbol = .{
+                                        .source_info = newSourceInfo(
+                                            symbol.source_file,
+                                            other_sym_tok,
+                                        ),
+                                    },
+                                });
+                                return error.ParseFailure;
+                            };
+                            mem.writeInt(u32, @ptrCast(*[4]u8, &buf[index]), @intCast(u32, other_symbol.addr), endian);
+                            index += 4;
+                        },
+                    };
+
+                    if (inst.props.suffix) |suffix| {
+                        buf[index] = suffix;
+                        index += 1;
+                    }
+
+                    try file.write(buf[0..index]);
+                    assembly.next_map_addr += index;
+                    assembly.file_offset += index;
                 },
                 .data => |slice| {
                     try file.write(slice);
